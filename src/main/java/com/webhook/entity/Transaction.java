@@ -28,6 +28,5 @@ public class Transaction {
     private double amount;
     private LocalDateTime transactionDateTime;
     private String comment;
-    private int retryAttempts;
-    private boolean sendStatus;
+    private String status;
 }

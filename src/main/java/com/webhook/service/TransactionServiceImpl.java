@@ -12,6 +12,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
@@ -31,6 +33,7 @@ import java.util.stream.Stream;
  * @CreationDate 8/17/2023 11:00 AM
  */
 @Service
+@EnableScheduling
 public class TransactionServiceImpl implements TransactionService {
     @Autowired
     private TransactionRepository transactionRepository;
@@ -61,58 +64,89 @@ public class TransactionServiceImpl implements TransactionService {
         String message = "";
         Random random = new Random();
 
-        transaction.setTransactionId("ABC" + random.nextInt());
-        transaction.setTransactionDateTime(LocalDateTime.now());
-
-        Transaction savedTransaction = transactionRepository.save(transaction);
-
-        ClientWebhook clientWebhook = getClientWebhook(savedTransaction.getMerchantNumber());
+        ClientWebhook clientWebhook = getClientWebhook(transaction.getMerchantNumber());
 
         if (null != clientWebhook && StringUtils.isNotBlank(clientWebhook.getWebhookUrl())) {
-            String payload = String.format(
-                    "{\"merchantNumber\": \"%s\", \"transactionId\": \"%s\", \"amount\": %.2f, \"transactionDateTime\": \"%s\", \"comment\": \"%s\"}",
-                    savedTransaction.getMerchantNumber(), savedTransaction.getTransactionId(), savedTransaction.getAmount(),
-                    savedTransaction.getTransactionDateTime(), savedTransaction.getComment()
-            );
+            transaction.setTransactionId("ABC" + random.nextInt());
+            transaction.setTransactionDateTime(LocalDateTime.now());
+            transaction.setStatus("In Progress");
 
-            String encryptPayload = encryptPayload(payload);
+            Transaction savedTransaction = transactionRepository.save(transaction);
 
-            // Send the payload to the webhook URL
-            // Implement the webhook sending logic using an HTTP client library
-            HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.APPLICATION_JSON);
+            boolean sendStaus = sendDataToClient(savedTransaction, clientWebhook.getWebhookUrl());
 
-            HttpEntity<String> request = new HttpEntity<>(encryptPayload, headers);
-
-            int maxRetries = 3;
-            int retryAttempts = 0;
-            while (retryAttempts <= maxRetries) {
-                try {
-                    new RestTemplate().postForEntity(clientWebhook.getWebhookUrl(), request, String.class);
-                    savedTransaction.setSendStatus(true);
-                    break;
-                } catch (Exception e) {
-                    retryAttempts++;
-                }
-            }
-
-            savedTransaction.setRetryAttempts(retryAttempts);
-            transactionRepository.save(savedTransaction);
-
-            if (savedTransaction.isSendStatus()) {
+            if (sendStaus) {
                 message = "Transaction saved and send to merchant successfully.";
             } else {
-                message = "Transaction saved successfully but failed data sending operation by " + retryAttempts + " attempts.";
+                message = "Transaction saved successfully but failed data sending operation. We will try till 11:59 PM. If not able to send, your amount will be disbursed.";
             }
 
             System.out.println("Sending payload to webhook URL: " + clientWebhook.getWebhookUrl());
-            System.out.println("Payload: " + payload);
-            System.out.println("Encrypt Payload: " + encryptPayload);
         } else {
-            message = "Transaction saved successfully but failed data sending operation due to Webhook URL not found for merchant number: " + savedTransaction.getMerchantNumber() + ".";
+            message = "Transaction failed due to merchant number "+transaction.getMerchantNumber()+" not found.";
         }
 
         return message;
+    }
+
+    @Transactional
+    @Scheduled(fixedRate = 60000) // Every 1 minutes
+    public void retrySendingWebhooks() {
+        List<Transaction> inProgressTransactions = transactionRepository.findAllByStatus("In Progress");
+        for (Transaction transaction : inProgressTransactions) {
+            ClientWebhook clientWebhook = getClientWebhook(transaction.getMerchantNumber());
+
+            if (null != clientWebhook && StringUtils.isNotBlank(clientWebhook.getWebhookUrl())) {
+                boolean sendStaus = sendDataToClient(transaction, clientWebhook.getWebhookUrl());
+
+                if (sendStaus) {
+                    System.out.println("Send to merchant successfully.");
+                } else {
+                    System.out.println("Failed data sending operation. We will try till 11:59 PM. If not able to send, your amount will be disbursed.");
+                }
+            } else {
+                System.out.println("Failed due to merchant number " + transaction.getMerchantNumber()+" not found.");
+            }
+        }
+    }
+
+    @Transactional
+    @Scheduled(cron = "59 59 23 * * ?") // At 11:59:59 PM every day
+    public void deleteInProgressTransactions() {
+        List<Transaction> inProgressTransactions = transactionRepository.findAllByStatus("In Progress");
+        List<Transaction> failedTransactions = inProgressTransactions.stream().peek(transaction -> transaction.setStatus("Failed")).toList();
+
+        transactionRepository.saveAll(failedTransactions);
+    }
+
+    private boolean sendDataToClient(Transaction transaction, String webHookUrl) {
+        boolean returnStatus = false;
+        String payload = String.format(
+                "{\"merchantNumber\": \"%s\", \"transactionId\": \"%s\", \"amount\": %.2f, \"transactionDateTime\": \"%s\", \"comment\": \"%s\"}",
+                transaction.getMerchantNumber(), transaction.getTransactionId(), transaction.getAmount(),
+                transaction.getTransactionDateTime(), transaction.getComment()
+        );
+
+        String encryptPayload = encryptPayload(payload);
+
+        // Send the payload to the webhook URL
+        // Implement the webhook sending logic using an HTTP client library
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        HttpEntity<String> request = new HttpEntity<>(encryptPayload, headers);
+        try {
+            new RestTemplate().postForEntity(webHookUrl, request, String.class);
+            transaction.setStatus("Success");
+            transactionRepository.save(transaction);
+            returnStatus = true;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        System.out.println("Payload: " + payload);
+        System.out.println("Encrypt Payload: " + encryptPayload);
+        return returnStatus;
     }
 
     private ClientWebhook getClientWebhook(String merchantNumber) {
